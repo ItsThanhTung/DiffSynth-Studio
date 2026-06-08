@@ -85,18 +85,31 @@ def write_output_metadata(
     shared_t5: bool,
     shared_t5_rel: str,
     precomputed_dir: str,
+    include_clip_frame_index: bool = False,
 ) -> None:
     t5_paths = []
     clip_paths = []
+    clip_frame_indices = []
     for i, _row in df.iterrows():
         if shared_t5:
             t5_paths.append(os.path.abspath(os.path.join(base, shared_t5_rel)))
         else:
             t5_paths.append(os.path.abspath(os.path.join(base, f"{precomputed_dir}/t5/{i:06d}.pt")))
         clip_paths.append(os.path.abspath(os.path.join(base, f"{precomputed_dir}/clip/{i:06d}.pt")))
+        if include_clip_frame_index:
+            frame_index_path = os.path.join(base, f"{precomputed_dir}/clip_frame_index/{i:06d}.txt")
+            if not os.path.isfile(frame_index_path):
+                sys.exit(
+                    f"missing CLIP frame index file: {frame_index_path}. "
+                    "Regenerate random CLIP precompute outputs so VAE latents can use the same reference frame."
+                )
+            with open(frame_index_path, "r", encoding="utf-8") as f:
+                clip_frame_indices.append(int(f.read().strip()))
     df = df.copy()
     df["t5_context"] = t5_paths
     df["clip_feature"] = clip_paths
+    if include_clip_frame_index:
+        df["clip_frame_index"] = clip_frame_indices
     df.to_csv(out_csv, index=False)
     print(f"Wrote {out_csv} with columns t5_context, clip_feature ({len(df)} rows).", flush=True)
 
@@ -289,6 +302,7 @@ def launch_workers(args: argparse.Namespace) -> None:
         shared_t5=args.shared_t5,
         shared_t5_rel=shared_t5_rel,
         precomputed_dir=pdir,
+        include_clip_frame_index=args.clip_frame_mode == "random",
     )
 
 
@@ -374,7 +388,7 @@ def run_worker(args: argparse.Namespace) -> None:
             return os.path.abspath(pth)
         return os.path.abspath(os.path.join(base, pth))
 
-    def load_clip_pil(video_path: str, *, row_pos: int) -> Image.Image:
+    def load_clip_pil(video_path: str, *, row_pos: int) -> tuple[Image.Image, int]:
         reader = imageio.get_reader(video_path)
         try:
             total = int(reader.count_frames())
@@ -392,8 +406,8 @@ def run_worker(args: argparse.Namespace) -> None:
         im = Image.fromarray(frame).convert("RGB")
         if args.clip_geometry_mode == "crop_fixed":
             assert clip_frame_proc is not None
-            return clip_frame_proc(im)
-        return resize_pil_to_target_pixel_area(im, target_area)
+            return clip_frame_proc(im), idx
+        return resize_pil_to_target_pixel_area(im, target_area), idx
 
     df = pd.read_csv(meta_path)
     if "video" not in df.columns or "prompt" not in df.columns:
@@ -402,6 +416,8 @@ def run_worker(args: argparse.Namespace) -> None:
     pdir = args.precomputed_dir or ("precomputed_random" if args.clip_frame_mode == "random" else "precomputed")
     os.makedirs(os.path.join(base, pdir, "t5"), exist_ok=True)
     os.makedirs(os.path.join(base, pdir, "clip"), exist_ok=True)
+    if args.clip_frame_mode == "random":
+        os.makedirs(os.path.join(base, pdir, "clip_frame_index"), exist_ok=True)
 
     shared_t5_rel = f"{pdir}/t5/shared_single_prompt.pt"
     shared_t5_abs = os.path.join(base, shared_t5_rel)
@@ -483,7 +499,10 @@ def run_worker(args: argparse.Namespace) -> None:
                     ctx = encode_prompt_text(pipe, prompt)
                     torch.save(ctx.cpu(), t5_abs)
 
-            clip_pil = load_clip_pil(abs_video, row_pos=pos)
+            clip_pil, clip_frame_index = load_clip_pil(abs_video, row_pos=pos)
+            if args.clip_frame_mode == "random":
+                with open(os.path.join(base, pdir, "clip_frame_index", f"{row_idx:06d}.txt"), "w", encoding="utf-8") as f:
+                    f.write(f"{clip_frame_index}\n")
             pending_idx.append(row_idx)
             pending_images.append(preprocess_clip_tensor(clip_pil))
             if len(pending_images) >= clip_batch_size:
@@ -502,6 +521,7 @@ def run_worker(args: argparse.Namespace) -> None:
         shared_t5=args.shared_t5,
         shared_t5_rel=shared_t5_rel,
         precomputed_dir=pdir,
+        include_clip_frame_index=args.clip_frame_mode == "random",
     )
     if n_skip:
         print(f"Skipped {n_skip} rows (--skip_existing).", flush=True)

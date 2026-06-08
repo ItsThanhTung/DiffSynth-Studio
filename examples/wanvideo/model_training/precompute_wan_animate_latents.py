@@ -4,8 +4,9 @@ Precompute Wan Animate VAE-side tensors for one training step: main video latent
 face pixel values (after the same trim as WanVideoUnit_AnimateVideoSplit), and the first-frame `y`
 tensor (same as WanVideoUnit_ImageEmbedderVAE without end_image).
 
-Order matches the pipeline: encode full `video` first; trim pose/face to len(video)-4; then encode pose
-and preprocess face. Writes one dict per row via torch.save and a CSV column `wan_latent_cache`.
+Order matches the pipeline: build one reference latent slot plus target-video latent slots from
+len(video)-4 frames; trim pose/face to len(video)-4; then encode pose and preprocess face. Writes
+one dict per row via torch.save and a CSV column `wan_latent_cache`.
 
 Training: --precomputed_video_latents, metadata with wan_latent_cache (+ t5_context/clip_feature if using
 --precomputed_t5_clip). Omit Wan2.1_VAE.pth from --model_id_with_origin_paths.
@@ -16,8 +17,13 @@ import argparse
 import os
 import sys
 
+try:
+    import imageio.v2 as imageio
+except ModuleNotFoundError:
+    import imageio  # type: ignore
 import pandas as pd
 import torch
+from PIL import Image
 
 from diffsynth.core.data.operators import ImageCropAndResize, LoadVideo, ToAbsolutePath
 from diffsynth.diffusion.training_module import DiffusionTrainingModule
@@ -30,15 +36,24 @@ class _DitStub:
     has_image_pos_emb = False
 
 
-def compute_y_tensor(pipe: WanVideoPipeline, first_frame_pil, num_frames: int, height: int, width: int) -> torch.Tensor:
-    """Match WanVideoUnit_ImageEmbedderVAE (end_image=None)."""
-    image = pipe.preprocess_image(first_frame_pil.resize((width, height))).to(pipe.device)
-    msk = torch.ones(1, num_frames, height // 8, width // 8, device=pipe.device)
-    msk[:, 1:] = 0
-    vae_input = torch.concat(
-        [image.transpose(0, 1), torch.zeros(3, num_frames - 1, height, width, device=pipe.device, dtype=image.dtype)],
-        dim=1,
-    )
+def encode_y_condition(
+    pipe: WanVideoPipeline,
+    ref_frame_pil,
+    num_frames: int,
+    height: int,
+    width: int,
+    *,
+    mask_first_frame: bool,
+) -> torch.Tensor:
+    if num_frames <= 0:
+        raise ValueError(f"num_frames must be positive, got {num_frames}")
+    msk = torch.zeros(1, num_frames, height // 8, width // 8, device=pipe.device)
+    vae_input = torch.zeros(3, num_frames, height, width, device=pipe.device, dtype=pipe.torch_dtype)
+    if ref_frame_pil is not None:
+        image = pipe.preprocess_image(ref_frame_pil.resize((width, height))).to(pipe.device)
+        vae_input[:, :1] = image.transpose(0, 1).to(dtype=pipe.torch_dtype)
+    if mask_first_frame:
+        msk[:, :1] = 1
     msk = torch.concat([torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]], dim=1)
     msk = msk.view(1, msk.shape[1] // 4, 4, height // 8, width // 8)
     msk = msk.transpose(1, 2)[0]
@@ -50,7 +65,27 @@ def compute_y_tensor(pipe: WanVideoPipeline, first_frame_pil, num_frames: int, h
     y = y.to(dtype=pipe.torch_dtype, device=pipe.device)
     y = torch.concat([msk, y])
     y = y.unsqueeze(0).to(dtype=pipe.torch_dtype)
-    return y.cpu()
+    return y
+
+
+def compute_y_tensor(pipe: WanVideoPipeline, ref_frame_pil, target_num_frames: int, height: int, width: int) -> torch.Tensor:
+    """Match WanVideoUnit_ImageEmbedderVAE for Animate training."""
+    y_ref = encode_y_condition(pipe, ref_frame_pil, 1, height, width, mask_first_frame=True)
+    y_target = encode_y_condition(pipe, None, target_num_frames, height, width, mask_first_frame=False)
+    return torch.concat([y_ref, y_target], dim=2).cpu()
+
+
+def load_reference_frame(video_path: str, frame_index: int, frame_processor) -> object:
+    reader = imageio.get_reader(video_path)
+    try:
+        total = int(reader.count_frames())
+        if total <= 0:
+            raise ValueError(f"video has no frames: {video_path}")
+        frame_index = max(0, min(int(frame_index), total - 1))
+        frame = reader.get_data(frame_index)
+    finally:
+        reader.close()
+    return frame_processor(Image.fromarray(frame).convert("RGB"))
 
 
 def main():
@@ -86,6 +121,7 @@ def main():
             frame_processor=ImageCropAndResize(args.height, args.width, None, 16, 16),
         )
     )
+    ref_frame_processor = ImageCropAndResize(args.height, args.width, None, 16, 16)
     pose_loader = video_loader
     face_loader = (
         ToAbsolutePath(base)
@@ -116,11 +152,22 @@ def main():
             n = len(vid)
             if n < 5:
                 sys.exit(f"row {i}: need at least 5 frames after load, got {n}")
+            target_num_frames = n - 4
             pose_trim = pose[: n - 4]
             face_trim = face[: n - 4]
 
             pv = pipe.preprocess_video(vid)
-            input_latents = pipe.vae.encode(pv, device=pipe.device, tiled=False).to(dtype=pipe.torch_dtype)
+            if "clip_frame_index" in row and not pd.isna(row["clip_frame_index"]):
+                video_path = row["video"]
+                if not os.path.isabs(str(video_path)):
+                    video_path = os.path.join(base, str(video_path))
+                ref_frame = load_reference_frame(str(video_path), int(row["clip_frame_index"]), ref_frame_processor)
+            else:
+                ref_frame = vid[0]
+            ref_pv = pipe.preprocess_video([ref_frame])
+            ref_latents = pipe.vae.encode(ref_pv, device=pipe.device, tiled=False).to(dtype=pipe.torch_dtype)
+            target_latents = pipe.vae.encode(pv[:, :, :target_num_frames], device=pipe.device, tiled=False).to(dtype=pipe.torch_dtype)
+            input_latents = torch.concat([ref_latents, target_latents], dim=2)
 
             pose_pv = pipe.preprocess_video(pose_trim)
             pose_latents = pipe.vae.encode(pose_pv, device=pipe.device, tiled=False).to(dtype=pipe.torch_dtype)
@@ -134,7 +181,7 @@ def main():
                     f"row {i}: pipeline shape check would change num_frames {n} -> {n2}. "
                     "Use a num_frames compatible with the pipeline time_division_factor / remainder (same as training)."
                 )
-            y = compute_y_tensor(pipe, vid[0], n2, h2, w2)
+            y = compute_y_tensor(pipe, ref_frame, target_num_frames, h2, w2)
 
             bundle = {
                 "input_latents": input_latents.cpu().to(torch.bfloat16),

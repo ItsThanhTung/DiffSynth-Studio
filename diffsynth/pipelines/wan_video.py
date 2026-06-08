@@ -413,12 +413,12 @@ class WanVideoUnit_NoiseInitializer(PipelineUnit):
 class WanVideoUnit_InputVideoEmbedder(PipelineUnit):
     def __init__(self):
         super().__init__(
-            input_params=("input_latents", "input_video", "noise", "tiled", "tile_size", "tile_stride", "vace_reference_image", "framewise_decoding"),
+            input_params=("input_latents", "input_video", "input_image", "noise", "tiled", "tile_size", "tile_stride", "vace_reference_image", "framewise_decoding", "animate_pose_video", "animate_face_video"),
             output_params=("latents", "input_latents"),
             onload_model_names=("vae",)
         )
 
-    def process(self, pipe: WanVideoPipeline, input_latents, input_video, noise, tiled, tile_size, tile_stride, vace_reference_image, framewise_decoding):
+    def process(self, pipe: WanVideoPipeline, input_latents, input_video, input_image, noise, tiled, tile_size, tile_stride, vace_reference_image, framewise_decoding, animate_pose_video, animate_face_video):
         if input_video is None:
             if input_latents is not None and pipe.scheduler.training:
                 il = input_latents.to(device=pipe.device, dtype=pipe.torch_dtype)
@@ -426,7 +426,12 @@ class WanVideoUnit_InputVideoEmbedder(PipelineUnit):
             return {"latents": noise}
         pipe.load_models_to_device(self.onload_model_names)
         input_video = pipe.preprocess_video(input_video)
-        if framewise_decoding:
+        if pipe.scheduler.training and input_image is not None and animate_pose_video is not None and animate_face_video is not None:
+            target_video = input_video[:, :, :input_video.shape[2] - 4]
+            ref_latents = pipe.vae.encode(input_video[:, :, :1], device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride).to(dtype=pipe.torch_dtype, device=pipe.device)
+            target_latents = pipe.vae.encode(target_video, device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride).to(dtype=pipe.torch_dtype, device=pipe.device)
+            input_latents = torch.concat([ref_latents, target_latents], dim=2)
+        elif framewise_decoding:
             input_latents = pipe.vae.encode_framewise(input_video, device=pipe.device)
         else:
             input_latents = pipe.vae.encode(input_video, device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride).to(dtype=pipe.torch_dtype, device=pipe.device)
@@ -517,18 +522,23 @@ class WanVideoUnit_ImageEmbedderCLIP(PipelineUnit):
 class WanVideoUnit_ImageEmbedderVAE(PipelineUnit):
     def __init__(self):
         super().__init__(
-            input_params=("y", "input_image", "end_image", "num_frames", "height", "width", "tiled", "tile_size", "tile_stride"),
+            input_params=("y", "input_image", "end_image", "num_frames", "height", "width", "tiled", "tile_size", "tile_stride", "animate_pose_video", "animate_face_video"),
             output_params=("y",),
             onload_model_names=("vae",)
         )
 
-    def process(self, pipe: WanVideoPipeline, y, input_image, end_image, num_frames, height, width, tiled, tile_size, tile_stride):
+    def process(self, pipe: WanVideoPipeline, y, input_image, end_image, num_frames, height, width, tiled, tile_size, tile_stride, animate_pose_video, animate_face_video):
         if y is not None:
             return {"y": y.to(dtype=pipe.torch_dtype, device=pipe.device)}
         if input_image is None or not pipe.dit.require_vae_embedding:
             return {}
         pipe.load_models_to_device(self.onload_model_names)
         image = pipe.preprocess_image(input_image.resize((width, height))).to(pipe.device)
+        if pipe.scheduler.training and animate_pose_video is not None and animate_face_video is not None and end_image is None:
+            y_ref = self.encode_vae_condition(pipe, image, 1, height, width, tiled, tile_size, tile_stride, mask_first_frame=True)
+            y_target = self.encode_vae_condition(pipe, None, num_frames - 4, height, width, tiled, tile_size, tile_stride, mask_first_frame=False)
+            y = torch.concat([y_ref, y_target], dim=2)
+            return {"y": y.to(dtype=pipe.torch_dtype, device=pipe.device)}
         msk = torch.ones(1, num_frames, height//8, width//8, device=pipe.device)
         msk[:, 1:] = 0
         if end_image is not None:
@@ -548,6 +558,24 @@ class WanVideoUnit_ImageEmbedderVAE(PipelineUnit):
         y = y.unsqueeze(0)
         y = y.to(dtype=pipe.torch_dtype, device=pipe.device)
         return {"y": y}
+
+    def encode_vae_condition(self, pipe: WanVideoPipeline, image, num_frames, height, width, tiled, tile_size, tile_stride, mask_first_frame):
+        if num_frames <= 0:
+            raise ValueError(f"num_frames must be positive, got {num_frames}")
+        msk = torch.zeros(1, num_frames, height//8, width//8, device=pipe.device)
+        frames = torch.zeros(3, num_frames, height, width, dtype=pipe.torch_dtype, device=pipe.device)
+        if image is not None:
+            frames[:, :1] = image.transpose(0, 1).to(dtype=pipe.torch_dtype, device=pipe.device)
+        if mask_first_frame:
+            msk[:, :1] = 1
+        msk = torch.concat([torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]], dim=1)
+        msk = msk.view(1, msk.shape[1] // 4, 4, height//8, width//8)
+        msk = msk.transpose(1, 2)[0]
+        y = pipe.vae.encode([frames], device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)[0]
+        y = y.to(dtype=pipe.torch_dtype, device=pipe.device)
+        y = torch.concat([msk, y])
+        y = y.unsqueeze(0)
+        return y.to(dtype=pipe.torch_dtype, device=pipe.device)
 
 
 
